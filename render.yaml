@@ -11,3 +11,5 @@ services:
         generateValue: true
       - key: MAX_FILE_MB
         value: 49
+      - key: TIKTOK_COOKIES_B64
+        sync: false
