@@ -16,10 +16,25 @@ const downloadDir = path.join(root, 'downloads');
 fs.mkdirSync(downloadDir, { recursive: true });
 
 const cookieFile = path.join(root, 'data', 'tiktok-cookies.txt');
+let cookieStatus = 'missing';
 if (process.env.TIKTOK_COOKIES_B64) {
-  fs.mkdirSync(path.dirname(cookieFile), { recursive: true });
-  fs.writeFileSync(cookieFile, Buffer.from(process.env.TIKTOK_COOKIES_B64, 'base64'));
-  fs.chmodSync(cookieFile, 0o600);
+  try {
+    const decoded = Buffer.from(process.env.TIKTOK_COOKIES_B64.trim(), 'base64').toString('utf8');
+    const validLines = decoded.split(/\r?\n/).filter(line =>
+      line && !line.startsWith('#') && line.split('\t').length >= 7
+    );
+    const valid = /# Netscape HTTP Cookie File/i.test(decoded)
+      && validLines.length > 0
+      && validLines.some(line => /(?:^|\.)tiktok\.com\t/i.test(line));
+    if (!valid) throw new Error('not a Netscape TikTok cookies.txt file');
+    fs.mkdirSync(path.dirname(cookieFile), { recursive: true });
+    fs.writeFileSync(cookieFile, decoded);
+    fs.chmodSync(cookieFile, 0o600);
+    cookieStatus = 'valid';
+  } catch (error) {
+    cookieStatus = 'invalid';
+    console.error('[Cookies] TIKTOK_COOKIES_B64 is invalid:', error.message);
+  }
 }
 
 const stats = { startedAt: new Date().toISOString(), total: 0, success: 0, failed: 0, active: 0, platforms: {} };
@@ -145,13 +160,14 @@ async function download(url) {
     '--merge-output-format', 'mp4', '--write-thumbnail', '--convert-thumbnails', 'jpg',
     '-o', output
   ];
-  if (platformOf(url) === 'TikTok' && fs.existsSync(cookieFile)) args.push('--cookies', cookieFile);
+  if (platformOf(url) === 'TikTok' && cookieStatus === 'valid') args.push('--cookies', cookieFile);
   args.push(url);
   try {
     await run(args);
   } catch (error) {
-    if (platformOf(url) === 'TikTok' && /log in|cookies/i.test(error.message) && !fs.existsSync(cookieFile)) {
-      throw new Error('Video này bắt buộc đăng nhập TikTok. Hãy cấu hình TIKTOK_COOKIES_B64 trên Render.');
+    if (platformOf(url) === 'TikTok' && /log in|cookies/i.test(error.message) && cookieStatus !== 'valid') {
+      const reason = cookieStatus === 'invalid' ? 'TIKTOK_COOKIES_B64 đang sai định dạng' : 'chưa có TIKTOK_COOKIES_B64';
+      throw new Error(`Video này bắt buộc đăng nhập TikTok nhưng ${reason}. Cần dùng cookies.txt định dạng Netscape.`);
     }
     throw error;
   }
@@ -201,7 +217,7 @@ bot.on('message', async msg => {
   }
 });
 
-app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime(), active: stats.active }));
+app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime(), active: stats.active, tiktokCookies: cookieStatus }));
 app.get('/dashboard', (req, res) => {
   if (req.query.key !== dashboardKey) return res.status(401).send('Unauthorized');
   res.send(`<!doctype html><html lang="vi"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Nobita Dashboard</title><style>body{margin:0;font-family:system-ui;background:#08111f;color:#eaf2ff}.wrap{max-width:1050px;margin:auto;padding:40px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:18px}.card{padding:24px;border:1px solid #263b59;border-radius:18px;background:linear-gradient(145deg,#111f33,#0b1727);box-shadow:0 15px 40px #0005}.n{font-size:38px;font-weight:800;color:#6ee7ff}.muted{color:#91a4be}h1{font-size:34px}</style><div class="wrap"><h1>🚀 Nobita Media Bot</h1><p class="muted">Hoạt động từ ${stats.startedAt}</p><div class="grid"><div class="card"><div class="n">${stats.total}</div>Tổng yêu cầu</div><div class="card"><div class="n">${stats.success}</div>Thành công</div><div class="card"><div class="n">${stats.failed}</div>Thất bại</div><div class="card"><div class="n">${stats.active}</div>Đang xử lý</div></div><h2>Nền tảng</h2><div class="grid">${Object.entries(stats.platforms).map(([k,v])=>`<div class="card"><div class="n">${v}</div>${k}</div>`).join('')}</div></div></html>`);
