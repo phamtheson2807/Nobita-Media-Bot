@@ -101,6 +101,37 @@ async function downloadTikTokApi(url, dir) {
   return { dir, videos: [file], images: [] };
 }
 
+async function downloadTikWmApiPro(url, dir) {
+  const apiKey = process.env.TIKWMAPI_KEY?.trim();
+  if (!apiKey) throw new Error('TIKWMAPI_KEY is not configured');
+  const axios = require('axios');
+  const response = await axios.get('https://api.tikwmapi.com/', {
+    params: { url, hd: 1 }, timeout: 15000,
+    headers: { 'x-tikwmapi-key': apiKey, Accept: 'application/json' }
+  });
+  const body = response.data;
+  if (body?.code !== 0 || !body?.data) {
+    throw new Error(`TikWMAPI: ${body?.msg || `code ${body?.code ?? 'unknown'}`}`);
+  }
+  const data = body.data;
+  const apiImages = data.images || data.image_post?.images;
+  if (Array.isArray(apiImages) && apiImages.length) {
+    const images = [];
+    for (let i = 0; i < Math.min(apiImages.length, 35); i++) {
+      const imageUrl = typeof apiImages[i] === 'string' ? apiImages[i] : apiImages[i]?.url_list?.[0] || apiImages[i]?.display_image?.url_list?.[0];
+      if (!imageUrl) continue;
+      const file = path.join(dir, `tikwmapi-slide-${String(i + 1).padStart(2, '0')}.jpg`);
+      await saveRemote(imageUrl, file); images.push(file);
+    }
+    if (images.length) return { dir, videos: [], images };
+  }
+  const videoUrl = data.hdplay || data.play;
+  if (!videoUrl) throw new Error('TikWMAPI returned no MP4 video');
+  const file = path.join(dir, 'tikwmapi.mp4');
+  await saveRemote(videoUrl, file);
+  return { dir, videos: [file], images: [] };
+}
+
 async function normalizeTikTokUrl(url) {
   try {
     const axios = require('axios');
@@ -147,6 +178,8 @@ async function download(url) {
   const dir = path.join(downloadDir, id);
   await fsp.mkdir(dir, { recursive: true });
   if (platformOf(url) === 'TikTok') {
+    try { return await downloadTikWmApiPro(url, dir); }
+    catch (error) { console.log('[TikWMAPI]', error.message); }
     try { return await downloadTikTokApi(url, dir); }
     catch (error) { console.log('[TikTok API fallback]', error.message); }
     try { return await downloadTikTokMobile(url, dir); }
