@@ -38,8 +38,14 @@ if (process.env.TIKTOK_COOKIES_B64) {
 }
 
 const stats = { startedAt: new Date().toISOString(), total: 0, success: 0, failed: 0, active: 0, platforms: {} };
+const jobs = [];
 const bot = new TelegramBot(token, { polling: true });
 const app = express();
+
+function rememberJob(job) {
+  jobs.unshift(job);
+  if (jobs.length > 100) jobs.length = 100;
+}
 
 function platformOf(url) {
   const host = new URL(url).hostname.replace(/^www\./, '');
@@ -50,12 +56,18 @@ function platformOf(url) {
   return null;
 }
 
-function run(args, timeout = 150000) {
+function run(args, timeout = 150000, onProgress = () => {}) {
   return new Promise((resolve, reject) => {
     const child = spawn('yt-dlp', args, { cwd: root });
     let out = '', err = '';
     const timer = setTimeout(() => child.kill('SIGKILL'), timeout);
-    child.stdout.on('data', d => out += d);
+    child.stdout.on('data', d => {
+      out += d;
+      for (const line of String(d).split(/\r?\n/)) {
+        const match = line.match(/PROGRESS:\s*([\d.]+)%\|([^|]*)\|([^|]*)/);
+        if (match) onProgress({ percent: Number(match[1]), speed: match[2].trim(), eta: match[3].trim() });
+      }
+    });
     child.stderr.on('data', d => err += d);
     child.on('error', reject);
     child.on('close', code => {
@@ -65,10 +77,16 @@ function run(args, timeout = 150000) {
   });
 }
 
-async function saveRemote(url, file) {
+async function saveRemote(url, file, onProgress = () => {}) {
   const response = await require('axios').get(url, {
     responseType: 'stream', timeout: 20000, maxRedirects: 5,
     headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.tiktok.com/' }
+  });
+  const total = Number(response.headers['content-length'] || 0);
+  let loaded = 0;
+  response.data.on('data', chunk => {
+    loaded += chunk.length;
+    if (total) onProgress({ percent: loaded / total * 100, speed: '', eta: '' });
   });
   await new Promise((resolve, reject) => {
     const output = fs.createWriteStream(file);
@@ -77,7 +95,7 @@ async function saveRemote(url, file) {
   });
 }
 
-async function downloadTikTokApi(url, dir) {
+async function downloadTikTokApi(url, dir, onProgress) {
   const axios = require('axios');
   const body = new URLSearchParams({ url, hd: '1' }).toString();
   const response = await axios.post('https://www.tikwm.com/api/', body, {
@@ -90,18 +108,18 @@ async function downloadTikTokApi(url, dir) {
     const images = [];
     for (let i = 0; i < Math.min(data.images.length, 35); i++) {
       const file = path.join(dir, `slide-${String(i + 1).padStart(2, '0')}.jpg`);
-      await saveRemote(data.images[i], file); images.push(file);
+      await saveRemote(data.images[i], file, p => onProgress({ ...p, percent: ((i + p.percent / 100) / data.images.length) * 100 })); images.push(file);
     }
     return { dir, videos: [], images };
   }
   const videoUrl = data.hdplay || data.play;
   if (!videoUrl) throw new Error('TikTok API returned no media');
   const file = path.join(dir, 'tiktok.mp4');
-  await saveRemote(videoUrl, file);
+  await saveRemote(videoUrl, file, onProgress);
   return { dir, videos: [file], images: [] };
 }
 
-async function downloadTikWmApiPro(url, dir) {
+async function downloadTikWmApiPro(url, dir, onProgress) {
   const apiKey = process.env.TIKWMAPI_KEY?.trim();
   if (!apiKey) throw new Error('TIKWMAPI_KEY is not configured');
   const axios = require('axios');
@@ -121,14 +139,14 @@ async function downloadTikWmApiPro(url, dir) {
       const imageUrl = typeof apiImages[i] === 'string' ? apiImages[i] : apiImages[i]?.url_list?.[0] || apiImages[i]?.display_image?.url_list?.[0];
       if (!imageUrl) continue;
       const file = path.join(dir, `tikwmapi-slide-${String(i + 1).padStart(2, '0')}.jpg`);
-      await saveRemote(imageUrl, file); images.push(file);
+      await saveRemote(imageUrl, file, p => onProgress({ ...p, percent: ((i + p.percent / 100) / apiImages.length) * 100 })); images.push(file);
     }
     if (images.length) return { dir, videos: [], images };
   }
   const videoUrl = data.hdplay || data.play;
   if (!videoUrl) throw new Error('TikWMAPI returned no MP4 video');
   const file = path.join(dir, 'tikwmapi.mp4');
-  await saveRemote(videoUrl, file);
+  await saveRemote(videoUrl, file, onProgress);
   return { dir, videos: [file], images: [] };
 }
 
@@ -144,7 +162,7 @@ async function normalizeTikTokUrl(url) {
   } catch (_) { return url; }
 }
 
-async function downloadTikTokMobile(url, dir) {
+async function downloadTikTokMobile(url, dir, onProgress) {
   const axios = require('axios');
   const normalized = await normalizeTikTokUrl(url);
   const id = normalized.match(/\/(?:video|v)\/(\d+)/)?.[1] || normalized.match(/[?&](?:item_id|modal_id)=(\d+)/)?.[1];
@@ -166,29 +184,30 @@ async function downloadTikTokMobile(url, dir) {
       const media = video?.play_addr_h264?.url_list?.[0] || video?.play_addr?.url_list?.[0] || video?.download_addr?.url_list?.[0];
       if (!media) throw new Error('Mobile API returned no video');
       const file = path.join(dir, 'tiktok-mobile.mp4');
-      await saveRemote(media, file);
+      await saveRemote(media, file, onProgress);
       return { dir, videos: [file], images: [] };
     } catch (error) { lastError = error; }
   }
   throw lastError || new Error('TikTok mobile API unavailable');
 }
 
-async function download(url) {
+async function download(url, onProgress = () => {}) {
   const id = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const dir = path.join(downloadDir, id);
   await fsp.mkdir(dir, { recursive: true });
   if (platformOf(url) === 'TikTok') {
-    try { return await downloadTikWmApiPro(url, dir); }
+    try { return await downloadTikWmApiPro(url, dir, onProgress); }
     catch (error) { console.log('[TikWMAPI]', error.message); }
-    try { return await downloadTikTokApi(url, dir); }
+    try { return await downloadTikTokApi(url, dir, onProgress); }
     catch (error) { console.log('[TikTok API fallback]', error.message); }
-    try { return await downloadTikTokMobile(url, dir); }
+    try { return await downloadTikTokMobile(url, dir, onProgress); }
     catch (error) { console.log('[TikTok mobile fallback]', error.message); }
   }
   const output = path.join(dir, '%(playlist_index|0)03d-%(id)s.%(ext)s');
   const commonArgs = [
     '--no-warnings', '--no-check-certificates', '--playlist-end', '20',
     '--socket-timeout', '12', '--retries', '1', '--fragment-retries', '1',
+    '--newline', '--progress-template', 'download:PROGRESS:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s',
     '--merge-output-format', 'mp4', '--write-thumbnail', '--convert-thumbnails', 'jpg',
     '-o', output
   ];
@@ -207,7 +226,7 @@ async function download(url) {
     if (platform === 'TikTok' && cookieStatus === 'valid') args.push('--cookies', cookieFile);
     args.push(url);
     try {
-      await run(args);
+      await run(args, 150000, onProgress);
       downloadError = null;
       break;
     } catch (error) {
@@ -255,14 +274,39 @@ bot.on('message', async msg => {
   if (!platform) return bot.sendMessage(msg.chat.id, 'Link này chưa được hỗ trợ.');
   stats.total++; stats.active++; stats.platforms[platform] = (stats.platforms[platform] || 0) + 1;
   const wait = await bot.sendMessage(msg.chat.id, `⏳ Đang xử lý ${platform}...`);
+  const job = {
+    id: crypto.randomBytes(5).toString('hex'), platform, url,
+    user: msg.from?.username ? `@${msg.from.username}` : [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(' ') || String(msg.from?.id || ''),
+    userId: msg.from?.id, status: 'downloading', progress: 0,
+    speed: '', eta: '', startedAt: new Date().toISOString(), finishedAt: null, error: ''
+  };
+  rememberJob(job);
+  let lastProgressUpdate = 0;
+  const updateProgress = async progress => {
+    job.progress = Math.max(job.progress, Math.min(100, Number(progress.percent || 0)));
+    job.speed = progress.speed || job.speed; job.eta = progress.eta || job.eta;
+    const now = Date.now();
+    if (now - lastProgressUpdate < 1800 && job.progress < 100) return;
+    lastProgressUpdate = now;
+    const filled = Math.round(job.progress / 10);
+    const bar = '█'.repeat(filled) + '░'.repeat(10 - filled);
+    const details = [job.speed && `⚡ ${job.speed}`, job.eta && `⏱ ${job.eta}`].filter(Boolean).join(' · ');
+    await bot.editMessageText(`⬇️ Đang tải ${platform}\n${bar} ${job.progress.toFixed(1)}%${details ? `\n${details}` : ''}`, {
+      chat_id: msg.chat.id, message_id: wait.message_id
+    }).catch(() => {});
+  };
   let result;
   try {
-    result = await download(url);
+    result = await download(url, updateProgress);
+    job.status = 'sending'; job.progress = 100;
+    await bot.editMessageText(`📤 Đã tải xong, đang gửi ${platform}...`, { chat_id: msg.chat.id, message_id: wait.message_id }).catch(() => {});
     await sendResult(msg.chat.id, result, `✅ ${platform}`);
     stats.success++;
+    job.status = 'success'; job.finishedAt = new Date().toISOString();
     await bot.deleteMessage(msg.chat.id, wait.message_id).catch(() => {});
   } catch (error) {
     stats.failed++;
+    job.status = 'failed'; job.error = error.message.slice(0, 500); job.finishedAt = new Date().toISOString();
     console.error(`[${platform}]`, error.message);
     await bot.editMessageText(`❌ Không tải được: ${error.message.slice(0, 350)}`, { chat_id: msg.chat.id, message_id: wait.message_id });
   } finally {
@@ -272,9 +316,13 @@ bot.on('message', async msg => {
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime(), active: stats.active, tiktokCookies: cookieStatus }));
-app.get('/dashboard', (req, res) => {
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+app.get(['/dashboard', '/admin'], (req, res) => {
   if (req.query.key !== dashboardKey) return res.status(401).send('Unauthorized');
-  res.send(`<!doctype html><html lang="vi"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Nobita Dashboard</title><style>body{margin:0;font-family:system-ui;background:#08111f;color:#eaf2ff}.wrap{max-width:1050px;margin:auto;padding:40px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:18px}.card{padding:24px;border:1px solid #263b59;border-radius:18px;background:linear-gradient(145deg,#111f33,#0b1727);box-shadow:0 15px 40px #0005}.n{font-size:38px;font-weight:800;color:#6ee7ff}.muted{color:#91a4be}h1{font-size:34px}</style><div class="wrap"><h1>🚀 Nobita Media Bot</h1><p class="muted">Hoạt động từ ${stats.startedAt}</p><div class="grid"><div class="card"><div class="n">${stats.total}</div>Tổng yêu cầu</div><div class="card"><div class="n">${stats.success}</div>Thành công</div><div class="card"><div class="n">${stats.failed}</div>Thất bại</div><div class="card"><div class="n">${stats.active}</div>Đang xử lý</div></div><h2>Nền tảng</h2><div class="grid">${Object.entries(stats.platforms).map(([k,v])=>`<div class="card"><div class="n">${v}</div>${k}</div>`).join('')}</div></div></html>`);
+  const rows = jobs.map(j => `<tr><td><span class="status ${j.status}">${escapeHtml(j.status)}</span></td><td>${escapeHtml(j.platform)}</td><td>${escapeHtml(j.user)}</td><td><div class="progress"><i style="width:${j.progress}%"></i></div>${j.progress.toFixed(1)}%</td><td>${escapeHtml(j.speed || '—')}</td><td>${escapeHtml(j.eta || '—')}</td><td title="${escapeHtml(j.url)}">${escapeHtml(j.url.slice(0,45))}</td><td class="err">${escapeHtml(j.error || '—')}</td><td>${new Date(j.startedAt).toLocaleString('vi-VN')}</td></tr>`).join('');
+  res.send(`<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="refresh" content="4"><title>Nobita Admin</title><style>body{margin:0;font-family:Inter,system-ui;background:#07101e;color:#eaf2ff}.wrap{max-width:1400px;margin:auto;padding:30px}.top{display:flex;justify-content:space-between;align-items:center}.live{color:#6ee7a8}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:14px;margin:22px 0}.card{padding:20px;border:1px solid #263b59;border-radius:16px;background:#101d30}.n{font-size:34px;font-weight:800;color:#6ee7ff}.muted{color:#91a4be}.table{overflow:auto;border:1px solid #263b59;border-radius:16px}table{border-collapse:collapse;width:100%;min-width:1100px;background:#0d192a}th,td{text-align:left;padding:12px;border-bottom:1px solid #1e3049;font-size:13px}th{color:#91a4be;background:#111f33}.status{padding:4px 8px;border-radius:99px;background:#263b59}.status.success{background:#123c2b;color:#6ee7a8}.status.failed{background:#49202a;color:#ff9aaa}.status.downloading,.status.sending{background:#173956;color:#6ee7ff}.progress{width:110px;height:7px;background:#203149;border-radius:9px;overflow:hidden;display:inline-block;margin-right:7px}.progress i{display:block;height:100%;background:#45c9ec}.err{max-width:260px;color:#ffabb7}</style></head><body><div class="wrap"><div class="top"><div><h1>🚀 Nobita Admin</h1><div class="muted">Khởi động: ${escapeHtml(stats.startedAt)}</div></div><b class="live">● LIVE · tự tải lại 4 giây</b></div><div class="grid"><div class="card"><div class="n">${stats.total}</div>Tổng yêu cầu</div><div class="card"><div class="n">${stats.success}</div>Thành công</div><div class="card"><div class="n">${stats.failed}</div>Thất bại</div><div class="card"><div class="n">${stats.active}</div>Đang xử lý</div>${Object.entries(stats.platforms).map(([k,v])=>`<div class="card"><div class="n">${v}</div>${escapeHtml(k)}</div>`).join('')}</div><h2>Yêu cầu gần đây</h2><div class="table"><table><thead><tr><th>Trạng thái</th><th>Nền tảng</th><th>Người dùng</th><th>Tiến độ</th><th>Tốc độ</th><th>ETA</th><th>URL</th><th>Lỗi</th><th>Bắt đầu</th></tr></thead><tbody>${rows || '<tr><td colspan="9">Chưa có yêu cầu</td></tr>'}</tbody></table></div></div></body></html>`);
 });
 app.listen(port, () => console.log(`Web listening on ${port}`));
 
