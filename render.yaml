@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: nobita-media-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: DASHBOARD_KEY
+        generateValue: true
+      - key: MAX_FILE_MB
+        value: 49
