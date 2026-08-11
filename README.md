@@ -11,6 +11,12 @@ Telegram bot tải video TikTok, Facebook, YouTube và Instagram bằng MP4; h�
 
 Bot dùng polling nên không cần webhook. Cookie đăng nhập không được lưu trong repository.
 
+## TikWMAPI
+
+Đặt API key mới vào biến Render `TIKWMAPI_KEY`. Bot gọi `GET https://api.tikwmapi.com/`
+với header `x-tikwmapi-key`, ưu tiên `data.hdplay` rồi `data.play`. Không lưu key
+trong GitHub.
+
 ## Video TikTok yêu cầu đăng nhập
 
 Một số video nhạy cảm/giới hạn tuổi bắt buộc dùng cookie TikTok. Xuất cookie dạng Netscape
