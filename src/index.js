@@ -186,23 +186,44 @@ async function download(url) {
     catch (error) { console.log('[TikTok mobile fallback]', error.message); }
   }
   const output = path.join(dir, '%(playlist_index|0)03d-%(id)s.%(ext)s');
-  const args = [
+  const commonArgs = [
     '--no-warnings', '--no-check-certificates', '--playlist-end', '20',
     '--socket-timeout', '12', '--retries', '1', '--fragment-retries', '1',
-    '-f', 'best[ext=mp4][vcodec!=none]/best[vcodec!=none]',
     '--merge-output-format', 'mp4', '--write-thumbnail', '--convert-thumbnails', 'jpg',
     '-o', output
   ];
-  if (platformOf(url) === 'TikTok' && cookieStatus === 'valid') args.push('--cookies', cookieFile);
-  args.push(url);
-  try {
-    await run(args);
-  } catch (error) {
-    if (platformOf(url) === 'TikTok' && /log in|cookies/i.test(error.message) && cookieStatus !== 'valid') {
+  const platform = platformOf(url);
+  const formatSelectors = platform === 'Facebook'
+    ? [
+        'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
+        'bestvideo+bestaudio/best',
+        null
+      ]
+    : ['bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best[height<=720]/best'];
+  let downloadError;
+  for (const selector of formatSelectors) {
+    const args = [...commonArgs];
+    if (selector) args.push('-f', selector);
+    if (platform === 'TikTok' && cookieStatus === 'valid') args.push('--cookies', cookieFile);
+    args.push(url);
+    try {
+      await run(args);
+      downloadError = null;
+      break;
+    } catch (error) {
+      downloadError = error;
+      console.log(`[${platform}] Format ${selector || 'default'} failed: ${error.message.slice(-350)}`);
+      for (const name of await fsp.readdir(dir)) {
+        await fsp.rm(path.join(dir, name), { recursive: true, force: true }).catch(() => {});
+      }
+    }
+  }
+  if (downloadError) {
+    if (platform === 'TikTok' && /log in|cookies/i.test(downloadError.message) && cookieStatus !== 'valid') {
       const reason = cookieStatus === 'invalid' ? 'TIKTOK_COOKIES_B64 đang sai định dạng' : 'chưa có TIKTOK_COOKIES_B64';
       throw new Error(`Video này bắt buộc đăng nhập TikTok nhưng ${reason}. Cần dùng cookies.txt định dạng Netscape.`);
     }
-    throw error;
+    throw downloadError;
   }
   const names = await fsp.readdir(dir);
   const videos = names.filter(n => /\.(mp4|mov|mkv|webm)$/i.test(n)).map(n => path.join(dir, n));
