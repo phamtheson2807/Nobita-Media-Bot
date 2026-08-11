@@ -43,13 +43,53 @@ function run(args, timeout = 150000) {
   });
 }
 
+async function saveRemote(url, file) {
+  const response = await require('axios').get(url, {
+    responseType: 'stream', timeout: 20000, maxRedirects: 5,
+    headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.tiktok.com/' }
+  });
+  await new Promise((resolve, reject) => {
+    const output = fs.createWriteStream(file);
+    response.data.pipe(output);
+    output.on('finish', resolve); output.on('error', reject);
+  });
+}
+
+async function downloadTikTokApi(url, dir) {
+  const axios = require('axios');
+  const body = new URLSearchParams({ url, hd: '1' }).toString();
+  const response = await axios.post('https://www.tikwm.com/api/', body, {
+    timeout: 12000,
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'Mozilla/5.0' }
+  });
+  const data = response.data?.data;
+  if (response.data?.code !== 0 || !data) throw new Error('TikTok API unavailable');
+  if (Array.isArray(data.images) && data.images.length) {
+    const images = [];
+    for (let i = 0; i < Math.min(data.images.length, 35); i++) {
+      const file = path.join(dir, `slide-${String(i + 1).padStart(2, '0')}.jpg`);
+      await saveRemote(data.images[i], file); images.push(file);
+    }
+    return { dir, videos: [], images };
+  }
+  const videoUrl = data.hdplay || data.play;
+  if (!videoUrl) throw new Error('TikTok API returned no media');
+  const file = path.join(dir, 'tiktok.mp4');
+  await saveRemote(videoUrl, file);
+  return { dir, videos: [file], images: [] };
+}
+
 async function download(url) {
   const id = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const dir = path.join(downloadDir, id);
   await fsp.mkdir(dir, { recursive: true });
+  if (platformOf(url) === 'TikTok') {
+    try { return await downloadTikTokApi(url, dir); }
+    catch (error) { console.log('[TikTok API fallback]', error.message); }
+  }
   const output = path.join(dir, '%(playlist_index|0)03d-%(id)s.%(ext)s');
   await run([
-    '--no-warnings', '--no-check-certificates', '--no-playlist',
+    '--no-warnings', '--no-check-certificates', '--playlist-end', '20',
     '--socket-timeout', '12', '--retries', '1', '--fragment-retries', '1',
     '-f', 'best[ext=mp4][vcodec!=none]/best[vcodec!=none]',
     '--merge-output-format', 'mp4', '--write-thumbnail', '--convert-thumbnails', 'jpg',
