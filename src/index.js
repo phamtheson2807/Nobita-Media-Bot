@@ -15,6 +15,13 @@ const root = path.resolve(__dirname, '..');
 const downloadDir = path.join(root, 'downloads');
 fs.mkdirSync(downloadDir, { recursive: true });
 
+const cookieFile = path.join(root, 'data', 'tiktok-cookies.txt');
+if (process.env.TIKTOK_COOKIES_B64) {
+  fs.mkdirSync(path.dirname(cookieFile), { recursive: true });
+  fs.writeFileSync(cookieFile, Buffer.from(process.env.TIKTOK_COOKIES_B64, 'base64'));
+  fs.chmodSync(cookieFile, 0o600);
+}
+
 const stats = { startedAt: new Date().toISOString(), total: 0, success: 0, failed: 0, active: 0, platforms: {} };
 const bot = new TelegramBot(token, { polling: true });
 const app = express();
@@ -79,6 +86,47 @@ async function downloadTikTokApi(url, dir) {
   return { dir, videos: [file], images: [] };
 }
 
+async function normalizeTikTokUrl(url) {
+  try {
+    const axios = require('axios');
+    const response = await axios.get(url, {
+      maxRedirects: 5, timeout: 10000,
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      validateStatus: status => status >= 200 && status < 400
+    });
+    return response.request?.res?.responseUrl || response.request?._redirectable?._currentUrl || url;
+  } catch (_) { return url; }
+}
+
+async function downloadTikTokMobile(url, dir) {
+  const axios = require('axios');
+  const normalized = await normalizeTikTokUrl(url);
+  const id = normalized.match(/\/(?:video|v)\/(\d+)/)?.[1] || normalized.match(/[?&](?:item_id|modal_id)=(\d+)/)?.[1];
+  if (!id) throw new Error('TikTok video ID not found');
+  const hosts = [
+    'https://api16-normal-c-useast1a.tiktokv.com',
+    'https://api16-normal-useast5.us.tiktokv.com',
+    'https://api22-normal-c-useast1a.tiktokv.com'
+  ];
+  let lastError;
+  for (const host of hosts) {
+    try {
+      const response = await axios.get(`${host}/aweme/v1/feed/`, {
+        params: { aweme_id: id }, timeout: 7000,
+        headers: { 'User-Agent': 'com.zhiliaoapp.musically/2022600030 (Linux; Android 13; en_US)', Accept: 'application/json' }
+      });
+      const item = response.data?.aweme_list?.[0] || response.data?.item_list?.[0];
+      const video = item?.video;
+      const media = video?.play_addr_h264?.url_list?.[0] || video?.play_addr?.url_list?.[0] || video?.download_addr?.url_list?.[0];
+      if (!media) throw new Error('Mobile API returned no video');
+      const file = path.join(dir, 'tiktok-mobile.mp4');
+      await saveRemote(media, file);
+      return { dir, videos: [file], images: [] };
+    } catch (error) { lastError = error; }
+  }
+  throw lastError || new Error('TikTok mobile API unavailable');
+}
+
 async function download(url) {
   const id = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const dir = path.join(downloadDir, id);
@@ -86,15 +134,27 @@ async function download(url) {
   if (platformOf(url) === 'TikTok') {
     try { return await downloadTikTokApi(url, dir); }
     catch (error) { console.log('[TikTok API fallback]', error.message); }
+    try { return await downloadTikTokMobile(url, dir); }
+    catch (error) { console.log('[TikTok mobile fallback]', error.message); }
   }
   const output = path.join(dir, '%(playlist_index|0)03d-%(id)s.%(ext)s');
-  await run([
+  const args = [
     '--no-warnings', '--no-check-certificates', '--playlist-end', '20',
     '--socket-timeout', '12', '--retries', '1', '--fragment-retries', '1',
     '-f', 'best[ext=mp4][vcodec!=none]/best[vcodec!=none]',
     '--merge-output-format', 'mp4', '--write-thumbnail', '--convert-thumbnails', 'jpg',
-    '-o', output, url
-  ]);
+    '-o', output
+  ];
+  if (platformOf(url) === 'TikTok' && fs.existsSync(cookieFile)) args.push('--cookies', cookieFile);
+  args.push(url);
+  try {
+    await run(args);
+  } catch (error) {
+    if (platformOf(url) === 'TikTok' && /log in|cookies/i.test(error.message) && !fs.existsSync(cookieFile)) {
+      throw new Error('Video này bắt buộc đăng nhập TikTok. Hãy cấu hình TIKTOK_COOKIES_B64 trên Render.');
+    }
+    throw error;
+  }
   const names = await fsp.readdir(dir);
   const videos = names.filter(n => /\.(mp4|mov|mkv|webm)$/i.test(n)).map(n => path.join(dir, n));
   const images = names.filter(n => /\.(jpg|jpeg|png|webp)$/i.test(n)).map(n => path.join(dir, n));
