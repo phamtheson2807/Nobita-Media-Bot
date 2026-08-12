@@ -10,6 +10,8 @@ const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) throw new Error('Missing TELEGRAM_BOT_TOKEN');
 const port = Number(process.env.PORT || 3000);
 const maxBytes = Number(process.env.MAX_FILE_MB || 49) * 1024 * 1024;
+const downloadTtlMs = Number(process.env.DOWNLOAD_LINK_MINUTES || 60) * 60 * 1000;
+const publicBaseUrl = (process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || 'https://nobita-media-bot.onrender.com').replace(/\/$/, '');
 const dashboardKey = process.env.DASHBOARD_KEY || crypto.randomBytes(18).toString('hex');
 const root = path.resolve(__dirname, '..');
 const downloadDir = path.join(root, 'downloads');
@@ -39,6 +41,7 @@ if (process.env.TIKTOK_COOKIES_B64) {
 
 const stats = { startedAt: new Date().toISOString(), total: 0, success: 0, failed: 0, active: 0, platforms: {} };
 const jobs = [];
+const publicDownloads = new Map();
 const bot = new TelegramBot(token, { polling: true });
 const app = express();
 
@@ -118,6 +121,20 @@ async function fitVideoForTelegram(file) {
     throw new Error(`Đã nén nhưng video vẫn quá giới hạn Telegram: ${(outputSize / 1048576).toFixed(1)} MB`);
   }
   return output;
+}
+
+function createDownloadLink(file, dir) {
+  const token = crypto.randomBytes(24).toString('hex');
+  const expiresAt = Date.now() + downloadTtlMs;
+  publicDownloads.set(token, { file, dir, expiresAt });
+  const timer = setTimeout(async () => {
+    const item = publicDownloads.get(token);
+    if (!item) return;
+    publicDownloads.delete(token);
+    await fsp.rm(item.dir, { recursive: true, force: true }).catch(() => {});
+  }, downloadTtlMs);
+  timer.unref?.();
+  return `${publicBaseUrl}/download/${token}`;
 }
 
 async function saveRemote(url, file, onProgress = () => {}) {
@@ -295,8 +312,15 @@ async function download(url, onProgress = () => {}) {
 }
 
 async function sendResult(chatId, result, caption, onCompress = () => {}) {
+  let retained = false;
   for (const file of result.videos) {
     const size = (await fsp.stat(file)).size;
+    if (size > maxBytes && process.env.LARGE_FILE_MODE !== 'compress') {
+      const link = createDownloadLink(file, result.dir);
+      retained = true;
+      await bot.sendMessage(chatId, `✅ ${caption.replace(/^✅\s*/, '')}\n\n📦 Dung lượng: ${(size / 1048576).toFixed(1)} MB\n🔗 Link tải trực tiếp:\n${link}\n\n⏳ Link tự xóa sau ${Math.round(downloadTtlMs / 60000)} phút.`);
+      continue;
+    }
     if (size > maxBytes) await onCompress(size);
     const sendFile = await fitVideoForTelegram(file);
     await bot.sendVideo(chatId, sendFile, { caption, supports_streaming: true }, { filename: 'video.mp4', contentType: 'video/mp4' });
@@ -305,6 +329,7 @@ async function sendResult(chatId, result, caption, onCompress = () => {}) {
     const group = result.images.slice(i, i + 10).map((file, index) => ({ type: 'photo', media: file, caption: i === 0 && index === 0 ? caption : undefined }));
     await bot.sendMediaGroup(chatId, group);
   }
+  return retained;
 }
 
 bot.onText(/\/start/, msg => bot.sendMessage(msg.chat.id, 'Gửi link TikTok, Facebook, YouTube hoặc Instagram để tải MP4/ảnh.'));
@@ -344,12 +369,13 @@ bot.on('message', async msg => {
     result = await download(url, updateProgress);
     job.status = 'sending'; job.progress = 100;
     await bot.editMessageText(`📤 Đã tải xong, đang gửi ${platform}...`, { chat_id: msg.chat.id, message_id: wait.message_id }).catch(() => {});
-    await sendResult(msg.chat.id, result, `✅ ${platform}`, async size => {
+    const retained = await sendResult(msg.chat.id, result, `✅ ${platform}`, async size => {
       job.status = 'compressing'; job.speed = ''; job.eta = '';
       await bot.editMessageText(`🗜 Video ${(size / 1048576).toFixed(1)} MB vượt giới hạn Telegram. Đang tự động nén xuống dưới ${(maxBytes / 1048576).toFixed(0)} MB...`, {
         chat_id: msg.chat.id, message_id: wait.message_id
       }).catch(() => {});
     });
+    result.retained = retained;
     stats.success++;
     job.status = 'success'; job.finishedAt = new Date().toISOString();
     await bot.deleteMessage(msg.chat.id, wait.message_id).catch(() => {});
@@ -360,11 +386,19 @@ bot.on('message', async msg => {
     await bot.editMessageText(`❌ Không tải được: ${error.message.slice(0, 350)}`, { chat_id: msg.chat.id, message_id: wait.message_id });
   } finally {
     stats.active--;
-    if (result?.dir) await fsp.rm(result.dir, { recursive: true, force: true }).catch(() => {});
+    if (result?.dir && !result.retained) await fsp.rm(result.dir, { recursive: true, force: true }).catch(() => {});
   }
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime(), active: stats.active, tiktokCookies: cookieStatus }));
+app.get('/download/:token', async (req, res) => {
+  const item = publicDownloads.get(req.params.token);
+  if (!item || item.expiresAt <= Date.now()) return res.status(404).send('Link đã hết hạn hoặc không tồn tại.');
+  try { await fsp.access(item.file); }
+  catch { publicDownloads.delete(req.params.token); return res.status(404).send('File không còn tồn tại.'); }
+  res.set('Cache-Control', 'private, no-store');
+  res.download(item.file, 'video.mp4');
+});
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
 }
