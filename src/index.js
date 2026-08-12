@@ -5,6 +5,7 @@ const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
 const crypto = require('crypto');
+const { pipeline } = require('stream/promises');
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
 if (!token) throw new Error('Missing TELEGRAM_BOT_TOKEN');
@@ -139,20 +140,21 @@ function createDownloadLink(file, dir) {
 
 async function saveRemote(url, file, onProgress = () => {}) {
   const response = await require('axios').get(url, {
-    responseType: 'stream', timeout: 20000, maxRedirects: 5,
+    responseType: 'stream', timeout: 60000, maxRedirects: 5,
+    maxContentLength: Infinity, maxBodyLength: Infinity,
     headers: { 'User-Agent': 'Mozilla/5.0', Referer: 'https://www.tiktok.com/' }
   });
   const total = Number(response.headers['content-length'] || 0);
   let loaded = 0;
   response.data.on('data', chunk => {
     loaded += chunk.length;
-    if (total) onProgress({ percent: loaded / total * 100, speed: '', eta: '' });
+    if (total) onProgress({ percent: Math.min(99, loaded / total * 99), speed: '', eta: '' });
   });
-  await new Promise((resolve, reject) => {
-    const output = fs.createWriteStream(file);
-    response.data.pipe(output);
-    output.on('finish', resolve); output.on('error', reject);
-  });
+  await pipeline(response.data, fs.createWriteStream(file));
+  const savedSize = (await fsp.stat(file)).size;
+  if (!savedSize) throw new Error('File tải về rỗng');
+  if (total && savedSize < total) throw new Error(`Tải chưa hoàn tất: ${savedSize}/${total} bytes`);
+  onProgress({ percent: 100, speed: '', eta: '' });
 }
 
 async function downloadTikTokApi(url, dir, onProgress) {
@@ -318,6 +320,7 @@ async function sendResult(chatId, result, caption, onCompress = () => {}) {
     if (size > maxBytes && process.env.LARGE_FILE_MODE !== 'compress') {
       const link = createDownloadLink(file, result.dir);
       retained = true;
+      await bot.sendChatAction(chatId, 'typing').catch(() => {});
       await bot.sendMessage(chatId, `✅ ${caption.replace(/^✅\s*/, '')}\n\n📦 Dung lượng: ${(size / 1048576).toFixed(1)} MB\n🔗 Link tải trực tiếp:\n${link}\n\n⏳ Link tự xóa sau ${Math.round(downloadTtlMs / 60000)} phút.`);
       continue;
     }
@@ -368,7 +371,11 @@ bot.on('message', async msg => {
   try {
     result = await download(url, updateProgress);
     job.status = 'sending'; job.progress = 100;
-    await bot.editMessageText(`📤 Đã tải xong, đang gửi ${platform}...`, { chat_id: msg.chat.id, message_id: wait.message_id }).catch(() => {});
+    const largestVideo = result.videos.length ? Math.max(...await Promise.all(result.videos.map(async file => (await fsp.stat(file)).size))) : 0;
+    const deliveryText = largestVideo > maxBytes && process.env.LARGE_FILE_MODE !== 'compress'
+      ? `🔗 Đã tải xong, đang tạo link tải ${platform}...`
+      : `📤 Đã tải xong, đang gửi ${platform}...`;
+    await bot.editMessageText(deliveryText, { chat_id: msg.chat.id, message_id: wait.message_id }).catch(() => {});
     const retained = await sendResult(msg.chat.id, result, `✅ ${platform}`, async size => {
       job.status = 'compressing'; job.speed = ''; job.eta = '';
       await bot.editMessageText(`🗜 Video ${(size / 1048576).toFixed(1)} MB vượt giới hạn Telegram. Đang tự động nén xuống dưới ${(maxBytes / 1048576).toFixed(0)} MB...`, {
