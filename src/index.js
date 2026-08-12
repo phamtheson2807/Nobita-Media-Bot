@@ -77,6 +77,49 @@ function run(args, timeout = 150000, onProgress = () => {}) {
   });
 }
 
+function runProcess(command, args, timeout = 720000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd: root });
+    let out = '', err = '';
+    const timer = setTimeout(() => child.kill('SIGKILL'), timeout);
+    child.stdout.on('data', d => out += d);
+    child.stderr.on('data', d => err += d);
+    child.on('error', reject);
+    child.on('close', code => {
+      clearTimeout(timer);
+      code === 0 ? resolve(out.trim()) : reject(new Error(err.trim().slice(-1800) || `${command} exited ${code}`));
+    });
+  });
+}
+
+async function fitVideoForTelegram(file) {
+  const size = (await fsp.stat(file)).size;
+  if (size <= maxBytes) return file;
+  const durationText = await runProcess('ffprobe', [
+    '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', file
+  ], 30000);
+  const duration = Number(durationText);
+  if (!Number.isFinite(duration) || duration <= 0) throw new Error('Không xác định được thời lượng để nén video lớn');
+  const targetBytes = Math.min(maxBytes * 0.93, 46 * 1024 * 1024);
+  const audioKbps = 64;
+  const videoKbps = Math.max(140, Math.min(1800, Math.floor(targetBytes * 8 / duration / 1000 - audioKbps - 24)));
+  const output = path.join(path.dirname(file), `${path.parse(file).name}-telegram.mp4`);
+  const passlog = path.join(path.dirname(file), `ffmpeg-pass-${crypto.randomBytes(4).toString('hex')}`);
+  const videoArgs = ['-c:v', 'libx264', '-preset', 'veryfast', '-b:v', `${videoKbps}k`, '-maxrate', `${Math.ceil(videoKbps * 1.15)}k`, '-bufsize', `${videoKbps * 2}k`, '-vf', 'scale=w=min(854\\,iw):h=-2', '-pix_fmt', 'yuv420p'];
+  try {
+    await runProcess('ffmpeg', ['-y', '-i', file, '-map', '0:v:0', ...videoArgs, '-pass', '1', '-passlogfile', passlog, '-an', '-f', 'null', '/dev/null']);
+    await runProcess('ffmpeg', ['-y', '-i', file, '-map', '0:v:0', '-map', '0:a?', ...videoArgs, '-pass', '2', '-passlogfile', passlog, '-c:a', 'aac', '-b:a', `${audioKbps}k`, '-movflags', '+faststart', output]);
+  } finally {
+    await Promise.all([`${passlog}-0.log`, `${passlog}-0.log.mbtree`].map(name => fsp.rm(name, { force: true }).catch(() => {})));
+  }
+  const outputSize = (await fsp.stat(output)).size;
+  if (outputSize > maxBytes) {
+    await fsp.rm(output, { force: true });
+    throw new Error(`Đã nén nhưng video vẫn quá giới hạn Telegram: ${(outputSize / 1048576).toFixed(1)} MB`);
+  }
+  return output;
+}
+
 async function saveRemote(url, file, onProgress = () => {}) {
   const response = await require('axios').get(url, {
     responseType: 'stream', timeout: 20000, maxRedirects: 5,
@@ -251,11 +294,12 @@ async function download(url, onProgress = () => {}) {
   return { dir, videos, images };
 }
 
-async function sendResult(chatId, result, caption) {
+async function sendResult(chatId, result, caption, onCompress = () => {}) {
   for (const file of result.videos) {
     const size = (await fsp.stat(file)).size;
-    if (size > maxBytes) throw new Error(`Video quá lớn: ${(size / 1048576).toFixed(1)} MB`);
-    await bot.sendVideo(chatId, file, { caption, supports_streaming: true }, { filename: 'video.mp4', contentType: 'video/mp4' });
+    if (size > maxBytes) await onCompress(size);
+    const sendFile = await fitVideoForTelegram(file);
+    await bot.sendVideo(chatId, sendFile, { caption, supports_streaming: true }, { filename: 'video.mp4', contentType: 'video/mp4' });
   }
   for (let i = 0; i < result.images.length; i += 10) {
     const group = result.images.slice(i, i + 10).map((file, index) => ({ type: 'photo', media: file, caption: i === 0 && index === 0 ? caption : undefined }));
@@ -300,7 +344,12 @@ bot.on('message', async msg => {
     result = await download(url, updateProgress);
     job.status = 'sending'; job.progress = 100;
     await bot.editMessageText(`📤 Đã tải xong, đang gửi ${platform}...`, { chat_id: msg.chat.id, message_id: wait.message_id }).catch(() => {});
-    await sendResult(msg.chat.id, result, `✅ ${platform}`);
+    await sendResult(msg.chat.id, result, `✅ ${platform}`, async size => {
+      job.status = 'compressing'; job.speed = ''; job.eta = '';
+      await bot.editMessageText(`🗜 Video ${(size / 1048576).toFixed(1)} MB vượt giới hạn Telegram. Đang tự động nén xuống dưới ${(maxBytes / 1048576).toFixed(0)} MB...`, {
+        chat_id: msg.chat.id, message_id: wait.message_id
+      }).catch(() => {});
+    });
     stats.success++;
     job.status = 'success'; job.finishedAt = new Date().toISOString();
     await bot.deleteMessage(msg.chat.id, wait.message_id).catch(() => {});
