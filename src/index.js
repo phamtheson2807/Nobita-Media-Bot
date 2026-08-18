@@ -43,6 +43,9 @@ if (process.env.TIKTOK_COOKIES_B64) {
 const stats = { startedAt: new Date().toISOString(), total: 0, success: 0, failed: 0, active: 0, platforms: {} };
 const jobs = [];
 const publicDownloads = new Map();
+const providerHealth = new Map();
+const providerFailureLimit = 2;
+const providerCooldownMs = 10 * 60 * 1000;
 const bot = new TelegramBot(token, { polling: true });
 const app = express();
 
@@ -60,16 +63,67 @@ function platformOf(url) {
   return null;
 }
 
+function formatBytes(bytes) {
+  const value = Number(bytes || 0);
+  if (!value) return '';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
+  return `${(value / (1024 ** index)).toFixed(index ? 1 : 0)} ${units[index]}`;
+}
+
+function formatEta(seconds) {
+  const value = Math.max(0, Math.round(Number(seconds || 0)));
+  if (!value) return '';
+  const minutes = Math.floor(value / 60);
+  const rest = value % 60;
+  return minutes ? `${minutes}m ${rest}s` : `${rest}s`;
+}
+
+function providerAvailable(name) {
+  return (providerHealth.get(name)?.blockedUntil || 0) <= Date.now();
+}
+
+function providerSucceeded(name) {
+  providerHealth.delete(name);
+}
+
+function providerFailed(name, error) {
+  const previous = providerHealth.get(name) || { failures: 0, blockedUntil: 0 };
+  const failures = previous.failures + 1;
+  const blockedUntil = failures >= providerFailureLimit ? Date.now() + providerCooldownMs : 0;
+  providerHealth.set(name, { failures: blockedUntil ? 0 : failures, blockedUntil, error: error.message });
+  if (blockedUntil) console.warn(`[Failover] ${name} paused for ${providerCooldownMs / 60000} minutes`);
+}
+
+async function tryProvider(name, task) {
+  if (!providerAvailable(name)) throw new Error(`${name} is cooling down`);
+  try {
+    const result = await task();
+    providerSucceeded(name);
+    return result;
+  } catch (error) {
+    providerFailed(name, error);
+    throw error;
+  }
+}
+
 function run(args, timeout = 150000, onProgress = () => {}) {
   return new Promise((resolve, reject) => {
     const child = spawn('yt-dlp', args, { cwd: root });
     let out = '', err = '';
     const timer = setTimeout(() => child.kill('SIGKILL'), timeout);
+    let progressBuffer = '';
     child.stdout.on('data', d => {
       out += d;
-      for (const line of String(d).split(/\r?\n/)) {
-        const match = line.match(/PROGRESS:\s*([\d.]+)%\|([^|]*)\|([^|]*)/);
-        if (match) onProgress({ percent: Number(match[1]), speed: match[2].trim(), eta: match[3].trim() });
+      progressBuffer += String(d);
+      const lines = progressBuffer.split(/\r?\n/);
+      progressBuffer = lines.pop() || '';
+      for (const line of lines) {
+        const match = line.match(/PROGRESS:\s*([\d.]+)%\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)/);
+        if (match) onProgress({
+          percent: Number(match[1]), downloaded: match[2].trim(), total: match[3].trim(),
+          speed: match[4].trim(), eta: match[5].trim()
+        });
       }
     });
     child.stderr.on('data', d => err += d);
@@ -146,15 +200,27 @@ async function saveRemote(url, file, onProgress = () => {}) {
   });
   const total = Number(response.headers['content-length'] || 0);
   let loaded = 0;
+  const startedAt = Date.now();
+  let lastReportedAt = 0;
   response.data.on('data', chunk => {
     loaded += chunk.length;
-    if (total) onProgress({ percent: Math.min(99, loaded / total * 99), speed: '', eta: '' });
+    const now = Date.now();
+    if (now - lastReportedAt < 500 && total && loaded < total) return;
+    lastReportedAt = now;
+    const seconds = Math.max((now - startedAt) / 1000, 0.1);
+    const bytesPerSecond = loaded / seconds;
+    onProgress({
+      percent: total ? Math.min(99.5, loaded / total * 100) : 0,
+      downloaded: formatBytes(loaded), total: formatBytes(total),
+      speed: bytesPerSecond ? `${formatBytes(bytesPerSecond)}/s` : '',
+      eta: total && bytesPerSecond ? formatEta((total - loaded) / bytesPerSecond) : ''
+    });
   });
   await pipeline(response.data, fs.createWriteStream(file));
   const savedSize = (await fsp.stat(file)).size;
   if (!savedSize) throw new Error('File tải về rỗng');
   if (total && savedSize < total) throw new Error(`Tải chưa hoàn tất: ${savedSize}/${total} bytes`);
-  onProgress({ percent: 100, speed: '', eta: '' });
+  onProgress({ percent: 100, downloaded: formatBytes(savedSize), total: formatBytes(total || savedSize), speed: '', eta: '' });
 }
 
 async function downloadTikTokApi(url, dir, onProgress) {
@@ -258,29 +324,30 @@ async function download(url, onProgress = () => {}) {
   const dir = path.join(downloadDir, id);
   await fsp.mkdir(dir, { recursive: true });
   if (platformOf(url) === 'TikTok') {
-    try { return await downloadTikWmApiPro(url, dir, onProgress); }
+    try { return await tryProvider('TikWMAPI Pro', () => downloadTikWmApiPro(url, dir, onProgress)); }
     catch (error) { console.log('[TikWMAPI]', error.message); }
-    try { return await downloadTikTokApi(url, dir, onProgress); }
+    try { return await tryProvider('TikWM public API', () => downloadTikTokApi(url, dir, onProgress)); }
     catch (error) { console.log('[TikTok API fallback]', error.message); }
-    try { return await downloadTikTokMobile(url, dir, onProgress); }
+    try { return await tryProvider('TikTok mobile API', () => downloadTikTokMobile(url, dir, onProgress)); }
     catch (error) { console.log('[TikTok mobile fallback]', error.message); }
   }
   const output = path.join(dir, '%(playlist_index|0)03d-%(id)s.%(ext)s');
   const commonArgs = [
-    '--no-warnings', '--no-check-certificates', '--playlist-end', '20',
+    '--no-warnings', '--no-check-certificates', '--no-playlist',
     '--socket-timeout', '12', '--retries', '1', '--fragment-retries', '1',
-    '--newline', '--progress-template', 'download:PROGRESS:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s',
-    '--merge-output-format', 'mp4', '--write-thumbnail', '--convert-thumbnails', 'jpg',
+    '--newline', '--progress-template', 'download:PROGRESS:%(progress._percent_str)s|%(progress._downloaded_bytes_str)s|%(progress._total_bytes_estimate_str)s|%(progress._speed_str)s|%(progress._eta_str)s',
+    '--merge-output-format', 'mp4',
     '-o', output
   ];
   const platform = platformOf(url);
   const formatSelectors = platform === 'Facebook'
     ? [
-        'bestvideo[height<=720]+bestaudio/best[height<=720]/best',
-        'bestvideo+bestaudio/best',
+        'bestvideo*+bestaudio/best',
+        'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
+        'best[ext=mp4][acodec!=none]/best',
         null
       ]
-    : ['bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best[height<=720]/best'];
+    : ['bestvideo*+bestaudio/best', 'best[ext=mp4][acodec!=none]/best'];
   let downloadError;
   for (const selector of formatSelectors) {
     const args = [...commonArgs];
@@ -288,7 +355,7 @@ async function download(url, onProgress = () => {}) {
     if (platform === 'TikTok' && cookieStatus === 'valid') args.push('--cookies', cookieFile);
     args.push(url);
     try {
-      await run(args, 150000, onProgress);
+      await tryProvider(`${platform} yt-dlp server ${formatSelectors.indexOf(selector) + 1}`, () => run(args, 240000, onProgress));
       downloadError = null;
       break;
     } catch (error) {
@@ -307,13 +374,17 @@ async function download(url, onProgress = () => {}) {
     throw downloadError;
   }
   const names = await fsp.readdir(dir);
-  const videos = names.filter(n => /\.(mp4|mov|mkv|webm)$/i.test(n)).map(n => path.join(dir, n));
-  const images = names.filter(n => /\.(jpg|jpeg|png|webp)$/i.test(n)).map(n => path.join(dir, n));
+  let videos = names.filter(n => /\.(mp4|mov|mkv|webm)$/i.test(n)).map(n => path.join(dir, n));
+  let images = names.filter(n => /\.(jpg|jpeg|png|webp)$/i.test(n)).map(n => path.join(dir, n));
+  if (platform === 'Facebook') {
+    videos = videos.slice(0, 1);
+    images = [];
+  }
   if (!videos.length && !images.length) throw new Error('Không tìm thấy video hoặc hình ảnh');
   return { dir, videos, images };
 }
 
-async function sendResult(chatId, result, caption, onCompress = () => {}) {
+async function sendResult(chatId, result, caption, replyToMessageId, onCompress = () => {}) {
   let retained = false;
   for (const file of result.videos) {
     const size = (await fsp.stat(file)).size;
@@ -321,16 +392,19 @@ async function sendResult(chatId, result, caption, onCompress = () => {}) {
       const link = createDownloadLink(file, result.dir);
       retained = true;
       await bot.sendChatAction(chatId, 'typing').catch(() => {});
-      await bot.sendMessage(chatId, `✅ ${caption.replace(/^✅\s*/, '')}\n\n📦 Dung lượng: ${(size / 1048576).toFixed(1)} MB\n🔗 Link tải trực tiếp:\n${link}\n\n⏳ Link tự xóa sau ${Math.round(downloadTtlMs / 60000)} phút.`);
+      await bot.sendMessage(chatId, `✅ ${caption.replace(/^✅\s*/, '')}\n\n📦 Dung lượng: ${(size / 1048576).toFixed(1)} MB\n🔗 Link tải trực tiếp:\n${link}\n\n⏳ Link tự xóa sau ${Math.round(downloadTtlMs / 60000)} phút.`, { reply_to_message_id: replyToMessageId });
       continue;
     }
     if (size > maxBytes) await onCompress(size);
     const sendFile = await fitVideoForTelegram(file);
-    await bot.sendVideo(chatId, sendFile, { caption, supports_streaming: true }, { filename: 'video.mp4', contentType: 'video/mp4' });
+    await bot.sendVideo(chatId, sendFile, {
+      caption: caption.slice(0, 1024), supports_streaming: true,
+      reply_to_message_id: replyToMessageId
+    }, { filename: 'video.mp4', contentType: 'video/mp4' });
   }
   for (let i = 0; i < result.images.length; i += 10) {
     const group = result.images.slice(i, i + 10).map((file, index) => ({ type: 'photo', media: file, caption: i === 0 && index === 0 ? caption : undefined }));
-    await bot.sendMediaGroup(chatId, group);
+    await bot.sendMediaGroup(chatId, group, { reply_to_message_id: replyToMessageId });
   }
   return retained;
 }
@@ -345,25 +419,28 @@ bot.on('message', async msg => {
   try { platform = platformOf(url); } catch (_) {}
   if (!platform) return bot.sendMessage(msg.chat.id, 'Link này chưa được hỗ trợ.');
   stats.total++; stats.active++; stats.platforms[platform] = (stats.platforms[platform] || 0) + 1;
-  const wait = await bot.sendMessage(msg.chat.id, `⏳ Đang xử lý ${platform}...`);
+  const wait = await bot.sendMessage(msg.chat.id, `╭━━ NOBITA DOWNLOAD\n┃ ${platform} · CHẤT LƯỢNG CAO NHẤT\n┃ ▱▱▱▱▱▱▱▱▱▱▱▱ 0.0%\n╰━━ Đang phân tích liên kết...`, { reply_to_message_id: msg.message_id });
   const job = {
     id: crypto.randomBytes(5).toString('hex'), platform, url,
     user: msg.from?.username ? `@${msg.from.username}` : [msg.from?.first_name, msg.from?.last_name].filter(Boolean).join(' ') || String(msg.from?.id || ''),
     userId: msg.from?.id, status: 'downloading', progress: 0,
-    speed: '', eta: '', startedAt: new Date().toISOString(), finishedAt: null, error: ''
+    speed: '', eta: '', downloaded: '', totalBytes: '', startedAt: new Date().toISOString(), finishedAt: null, error: ''
   };
   rememberJob(job);
   let lastProgressUpdate = 0;
   const updateProgress = async progress => {
     job.progress = Math.max(job.progress, Math.min(100, Number(progress.percent || 0)));
     job.speed = progress.speed || job.speed; job.eta = progress.eta || job.eta;
+    job.downloaded = progress.downloaded || job.downloaded; job.totalBytes = progress.total || job.totalBytes;
     const now = Date.now();
-    if (now - lastProgressUpdate < 1800 && job.progress < 100) return;
+    if (now - lastProgressUpdate < 1200 && job.progress < 100) return;
     lastProgressUpdate = now;
-    const filled = Math.round(job.progress / 10);
-    const bar = '█'.repeat(filled) + '░'.repeat(10 - filled);
-    const details = [job.speed && `⚡ ${job.speed}`, job.eta && `⏱ ${job.eta}`].filter(Boolean).join(' · ');
-    await bot.editMessageText(`⬇️ Đang tải ${platform}\n${bar} ${job.progress.toFixed(1)}%${details ? `\n${details}` : ''}`, {
+    const filled = Math.round(job.progress / 100 * 12);
+    const bar = '▰'.repeat(filled) + '▱'.repeat(12 - filled);
+    const size = [job.downloaded, job.totalBytes].filter(Boolean).join(' / ');
+    const metrics = [job.speed && `⚡ ${job.speed}`, job.eta && `⏱ còn ${job.eta}`].filter(Boolean).join(' · ');
+    const detailLines = [size && `┃ ${size}`, metrics && `┃ ${metrics}`].filter(Boolean).join('\n');
+    await bot.editMessageText(`╭━━ NOBITA DOWNLOAD\n┃ ${platform} · CHẤT LƯỢNG CAO NHẤT\n┃ ${bar} ${job.progress.toFixed(1)}%${detailLines ? `\n${detailLines}` : ''}\n╰━━ Đang tải video...`, {
       chat_id: msg.chat.id, message_id: wait.message_id
     }).catch(() => {});
   };
@@ -373,10 +450,10 @@ bot.on('message', async msg => {
     job.status = 'sending'; job.progress = 100;
     const largestVideo = result.videos.length ? Math.max(...await Promise.all(result.videos.map(async file => (await fsp.stat(file)).size))) : 0;
     const deliveryText = largestVideo > maxBytes && process.env.LARGE_FILE_MODE !== 'compress'
-      ? `🔗 Đã tải xong, đang tạo link tải ${platform}...`
-      : `📤 Đã tải xong, đang gửi ${platform}...`;
+      ? `╭━━ NOBITA DOWNLOAD\n┃ ${platform} · ▰▰▰▰▰▰▰▰▰▰▰▰ 100%\n╰━━ Đang tạo link tải trực tiếp...`
+      : `╭━━ NOBITA DOWNLOAD\n┃ ${platform} · ▰▰▰▰▰▰▰▰▰▰▰▰ 100%\n╰━━ Đang gửi video...`;
     await bot.editMessageText(deliveryText, { chat_id: msg.chat.id, message_id: wait.message_id }).catch(() => {});
-    const retained = await sendResult(msg.chat.id, result, `✅ ${platform}`, async size => {
+    const retained = await sendResult(msg.chat.id, result, `✅ ${platform} · Chất lượng cao nhất\n🔗 Link gốc: ${url}`, msg.message_id, async size => {
       job.status = 'compressing'; job.speed = ''; job.eta = '';
       await bot.editMessageText(`🗜 Video ${(size / 1048576).toFixed(1)} MB vượt giới hạn Telegram. Đang tự động nén xuống dưới ${(maxBytes / 1048576).toFixed(0)} MB...`, {
         chat_id: msg.chat.id, message_id: wait.message_id
@@ -385,7 +462,9 @@ bot.on('message', async msg => {
     result.retained = retained;
     stats.success++;
     job.status = 'success'; job.finishedAt = new Date().toISOString();
-    await bot.deleteMessage(msg.chat.id, wait.message_id).catch(() => {});
+    await bot.editMessageText(`✅ Hoàn tất ${platform} · video đã được gửi bên dưới.`, { chat_id: msg.chat.id, message_id: wait.message_id }).catch(() => {});
+    const cleanupTimer = setTimeout(() => bot.deleteMessage(msg.chat.id, wait.message_id).catch(() => {}), 3000);
+    cleanupTimer.unref?.();
   } catch (error) {
     stats.failed++;
     job.status = 'failed'; job.error = error.message.slice(0, 500); job.finishedAt = new Date().toISOString();
