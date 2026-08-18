@@ -462,9 +462,9 @@ bot.on('message', async msg => {
     result.retained = retained;
     stats.success++;
     job.status = 'success'; job.finishedAt = new Date().toISOString();
-    await bot.editMessageText(`✅ Hoàn tất ${platform} · video đã được gửi bên dưới.`, { chat_id: msg.chat.id, message_id: wait.message_id }).catch(() => {});
-    const cleanupTimer = setTimeout(() => bot.deleteMessage(msg.chat.id, wait.message_id).catch(() => {}), 3000);
-    cleanupTimer.unref?.();
+    await bot.deleteMessage(msg.chat.id, wait.message_id).catch(error => {
+      console.warn(`[Progress cleanup] ${error.message}`);
+    });
   } catch (error) {
     stats.failed++;
     job.status = 'failed'; job.error = error.message.slice(0, 500); job.finishedAt = new Date().toISOString();
