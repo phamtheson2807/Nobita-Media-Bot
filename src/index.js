@@ -1,3 +1,4 @@
+process.env.NTBA_FIX_350 = '1';
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const { spawn } = require('child_process');
@@ -45,7 +46,7 @@ const jobs = [];
 const publicDownloads = new Map();
 const providerHealth = new Map();
 const providerFailureLimit = 2;
-const providerCooldownMs = 10 * 60 * 1000;
+const providerCooldownMs = 60 * 1000;
 const bot = new TelegramBot(token, { polling: true });
 const app = express();
 
@@ -87,24 +88,19 @@ function providerSucceeded(name) {
   providerHealth.delete(name);
 }
 
+function isTemporaryProviderFailure(error) {
+  const status = Number(error.response?.status || 0);
+  return status === 429 || status >= 500 ||
+    ['ECONNABORTED', 'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND'].includes(error.code);
+}
+
 function providerFailed(name, error) {
+  if (!isTemporaryProviderFailure(error)) return;
   const previous = providerHealth.get(name) || { failures: 0, blockedUntil: 0 };
   const failures = previous.failures + 1;
   const blockedUntil = failures >= providerFailureLimit ? Date.now() + providerCooldownMs : 0;
   providerHealth.set(name, { failures: blockedUntil ? 0 : failures, blockedUntil, error: error.message });
-  if (blockedUntil) console.warn(`[Failover] ${name} paused for ${providerCooldownMs / 60000} minutes`);
-}
-
-async function tryProvider(name, task) {
-  if (!providerAvailable(name)) throw new Error(`${name} is cooling down`);
-  try {
-    const result = await task();
-    providerSucceeded(name);
-    return result;
-  } catch (error) {
-    providerFailed(name, error);
-    throw error;
-  }
+  if (blockedUntil) console.warn(`[Failover] ${name} paused for ${providerCooldownMs / 1000} seconds`);
 }
 
 function run(args, timeout = 150000, onProgress = () => {}) {
@@ -319,17 +315,47 @@ async function downloadTikTokMobile(url, dir, onProgress) {
   throw lastError || new Error('TikTok mobile API unavailable');
 }
 
+async function hasDownloadedMedia(dir) {
+  const names = await fsp.readdir(dir);
+  for (const name of names) {
+    if (!/\.(mp4|mov|mkv|webm|jpg|jpeg|png|webp)$/i.test(name)) continue;
+    if ((await fsp.stat(path.join(dir, name))).size > 0) return true;
+  }
+  return false;
+}
+
+async function clearDownloadDir(dir) {
+  for (const name of await fsp.readdir(dir)) {
+    await fsp.rm(path.join(dir, name), { recursive: true, force: true }).catch(() => {});
+  }
+}
+
 async function download(url, onProgress = () => {}) {
   const id = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const dir = path.join(downloadDir, id);
   await fsp.mkdir(dir, { recursive: true });
   if (platformOf(url) === 'TikTok') {
-    try { return await tryProvider('TikWMAPI Pro', () => downloadTikWmApiPro(url, dir, onProgress)); }
-    catch (error) { console.log('[TikWMAPI]', error.message); }
-    try { return await tryProvider('TikWM public API', () => downloadTikTokApi(url, dir, onProgress)); }
-    catch (error) { console.log('[TikTok API fallback]', error.message); }
-    try { return await tryProvider('TikTok mobile API', () => downloadTikTokMobile(url, dir, onProgress)); }
-    catch (error) { console.log('[TikTok mobile fallback]', error.message); }
+    const providers = [
+      { name: 'TikWMAPI Pro', enabled: Boolean(process.env.TIKWMAPI_KEY?.trim()), task: () => downloadTikWmApiPro(url, dir, onProgress) },
+      { name: 'TikWM public API', enabled: true, task: () => downloadTikTokApi(url, dir, onProgress) },
+      { name: 'TikTok mobile API', enabled: true, task: () => downloadTikTokMobile(url, dir, onProgress) }
+    ];
+    for (const provider of providers) {
+      if (!provider.enabled) continue;
+      if (!providerAvailable(provider.name)) {
+        console.log(`[Failover] Skipping temporarily unavailable ${provider.name}`);
+        continue;
+      }
+      try {
+        const result = await provider.task();
+        providerSucceeded(provider.name);
+        return result;
+      } catch (error) {
+        providerFailed(provider.name, error);
+        console.log(`[${provider.name}] ${error.message}`);
+        await clearDownloadDir(dir);
+      }
+    }
   }
   const output = path.join(dir, '%(playlist_index|0)03d-%(id)s.%(ext)s');
   const commonArgs = [
@@ -355,21 +381,20 @@ async function download(url, onProgress = () => {}) {
     if (platform === 'TikTok' && cookieStatus === 'valid') args.push('--cookies', cookieFile);
     args.push(url);
     try {
-      await tryProvider(`${platform} yt-dlp server ${formatSelectors.indexOf(selector) + 1}`, () => run(args, 240000, onProgress));
+      await run(args, 240000, onProgress);
+      if (!await hasDownloadedMedia(dir)) throw new Error('yt-dlp completed without a media file');
       downloadError = null;
       break;
     } catch (error) {
       downloadError = error;
       console.log(`[${platform}] Format ${selector || 'default'} failed: ${error.message.slice(-350)}`);
-      for (const name of await fsp.readdir(dir)) {
-        await fsp.rm(path.join(dir, name), { recursive: true, force: true }).catch(() => {});
-      }
+      await clearDownloadDir(dir);
     }
   }
   if (downloadError) {
-    if (platform === 'TikTok' && /log in|cookies/i.test(downloadError.message) && cookieStatus !== 'valid') {
+    if (platform === 'TikTok' && /log in|cookies|not be comfortable|unable to extract universal data/i.test(downloadError.message) && cookieStatus !== 'valid') {
       const reason = cookieStatus === 'invalid' ? 'TIKTOK_COOKIES_B64 đang sai định dạng' : 'chưa có TIKTOK_COOKIES_B64';
-      throw new Error(`Video này bắt buộc đăng nhập TikTok nhưng ${reason}. Cần dùng cookies.txt định dạng Netscape.`);
+      throw new Error(`TikTok yêu cầu đăng nhập hoặc đang chặn máy chủ. Hiện ${reason}; hãy cập nhật cookies.txt định dạng Netscape trên Render.`);
     }
     throw downloadError;
   }
